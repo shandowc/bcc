@@ -1,13 +1,13 @@
 #!/usr/bin/python
 # @lint-avoid-python-3-compatibility-imports
 #
-# funclatency   Time functions and print latency as a histogram.
+# gofunclatency   Time functions and print latency as a histogram.
 #               For Linux, uses BCC, eBPF.
 #
-# USAGE: funclatency [-h] [-p PID] [-i INTERVAL] [-T] [-u] [-m] [-F] [-r] [-v]
+# USAGE: gofunclatency [-h] [-p PID] [-i INTERVAL] [-T] [-u] [-m] [-F] [-r] [-v]
 #                    pattern
 #
-# Run "funclatency -h" for full usage.
+# Run "gofunclatency -h" for full usage.
 #
 # The pattern is a string with optional '*' wildcards, similar to file
 # globbing. If you'd prefer to use regular expressions, use the -r option.
@@ -32,16 +32,16 @@ import signal
 
 # arguments
 examples = """examples:
-    ./funclatency do_sys_open       # time the do_sys_open() kernel function
-    ./funclatency c:read            # time the read() C library function
-    ./funclatency -u vfs_read       # time vfs_read(), in microseconds
-    ./funclatency -m do_nanosleep   # time do_nanosleep(), in milliseconds
-    ./funclatency -i 2 -d 10 c:open # output every 2 seconds, for duration 10s
-    ./funclatency -mTi 5 vfs_read   # output every 5 seconds, with timestamps
-    ./funclatency -p 181 vfs_read   # time process 181 only
-    ./funclatency 'vfs_fstat*'      # time both vfs_fstat() and vfs_fstatat()
-    ./funclatency 'c:*printf'       # time the *printf family of functions
-    ./funclatency -F 'vfs_r*'       # show one histogram per matched function
+    ./gofunclatency do_sys_open       # time the do_sys_open() kernel function
+    ./gofunclatency c:read            # time the read() C library function
+    ./gofunclatency -u vfs_read       # time vfs_read(), in microseconds
+    ./gofunclatency -m do_nanosleep   # time do_nanosleep(), in milliseconds
+    ./gofunclatency -i 2 -d 10 c:open # output every 2 seconds, for duration 10s
+    ./gofunclatency -mTi 5 vfs_read   # output every 5 seconds, with timestamps
+    ./gofunclatency -p 181 vfs_read   # time process 181 only
+    ./gofunclatency 'vfs_fstat*'      # time both vfs_fstat() and vfs_fstatat()
+    ./gofunclatency 'c:*printf'       # time the *printf family of functions
+    ./gofunclatency -F 'vfs_r*'       # show one histogram per matched function
 """
 parser = argparse.ArgumentParser(
     description="Time functions and print latency as a histogram",
@@ -90,6 +90,7 @@ else:
 
 # define BPF program
 bpf_text = """
+#include <linux/sched.h>
 #include <uapi/linux/ptrace.h>
 
 typedef struct ip_pid {
@@ -102,18 +103,18 @@ typedef struct hist_key {
     u64 slot;
 } hist_key_t;
 
-BPF_HASH(tls, u32);
 BPF_HASH(start);
 STORAGE
 
-int log_goroutine_id(struct pt_regs *ctx) {
-    u32 pid = bpf_get_current_pid_tgid();
-    u64 goid = 0;
+static u64 get_goid()
+{
+    struct task_struct *t = (struct task_struct *)bpf_get_current_task();
+    void* fsbase = (void*)t->thread.fsbase;
     void* g;
-    bpf_probe_read(&g, sizeof(g), (void*)(ctx->sp+8));
+    bpf_probe_read(&g, sizeof(g), fsbase-8);
+    u64 goid;
     bpf_probe_read(&goid, sizeof(goid), g+152);
-    tls.update(&pid, &goid);
-    return 0;
+    return goid;
 }
 
 int trace_func_entry(struct pt_regs *ctx)
@@ -123,15 +124,12 @@ int trace_func_entry(struct pt_regs *ctx)
     u32 tgid = pid_tgid >> 32;
     FILTER
 
-    u64* pgoid = tls.lookup(&pid);
-    if (!pgoid) {
-        return 0;
-    }
+    u64 goid = get_goid();
 
     u64 ts = bpf_ktime_get_ns();
     
     ENTRYSTORE
-    start.update(pgoid, &ts);
+    start.update(&goid, &ts);
 
     return 0;
 }
@@ -142,19 +140,14 @@ int trace_func_return(struct pt_regs *ctx)
     u64 pid_tgid = bpf_get_current_pid_tgid();
     u32 pid = pid_tgid;
     u32 tgid = pid_tgid >> 32;
+    u64 goid = get_goid();
 
-    // calculate delta time
-    u64* pgoid = tls.lookup(&pid);
-    if (!pgoid) {
-        return 0;
-    }
-
-    tsp = start.lookup(pgoid);
+    tsp = start.lookup(&goid);
     if (!tsp) {
         return 0;   // missed start
     }
     delta = bpf_ktime_get_ns() - *tsp;
-    start.delete(pgoid);
+    start.delete(&goid);
     FACTOR
 
     // store as histogram
@@ -431,7 +424,6 @@ def attach_uprobe_for_latency(path=b'', sym=b''):
         print("err: can not find symbol addrs")
         exit()
 
-    b.attach_uprobe(name=path, sym=b'runtime.execute', fn_name="log_goroutine_id", pid=args.pid or -1)
     attach_uprobe_by_addr(b, path, addr=symbol.offset, fn_name="trace_func_entry")
     for raddr in raddrs:
         off = raddr - saddr
